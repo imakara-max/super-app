@@ -164,8 +164,10 @@
         setStatus("");
         render();
       } catch (e) {
-        if (!handleError(e, "読み込めませんでした") && !items) setStatus("読み込めませんでした", true);
-        else if (items) setStatus("");
+        // 原因が分かるよう、理由を画面に残す
+        if (!handleError(e, "読み込めませんでした")) {
+          setStatus(navigator.onLine ? `読み込めませんでした: ${e.message}` : "オフラインです。接続を確認してください。", true);
+        }
       } finally {
         loading = false;
         el.refresh.disabled = false;

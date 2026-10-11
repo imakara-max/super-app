@@ -1,5 +1,5 @@
 // アプリ本体（同一オリジンの静的ファイル）だけをキャッシュする。Google API の通信はキャッシュしない。
-const CACHE = "today-v1";
+const CACHE = "today-v2";
 const SHELL = [
   "./",
   "./index.html",

@@ -722,6 +722,12 @@ function pushUnsubscribe(endpoint) {
 
 // ---------- VAPID (通知を送るサーバーの署名。P-256 の ECDSA を BigInt で実装) ----------
 
+// BigInt の数値リテラル (1n など) は Apps Script のエディタが構文エラーにするため、BigInt() で作る
+const N0 = BigInt(0);
+const N1 = BigInt(1);
+const N2 = BigInt(2);
+const N3 = BigInt(3);
+
 const P256 = {
   p: BigInt('0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff'),
   n: BigInt('0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551'),
@@ -736,7 +742,7 @@ function vapidKeys() {
   const saved = store.getProperty('push:vapid');
   if (saved) return JSON.parse(saved);
   const seed = [Utilities.getUuid(), Utilities.getUuid(), Utilities.getUuid(), Utilities.getUuid(), Date.now()].join(':');
-  const d = (bytesToBig(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, seed)) % (P256.n - 1n)) + 1n;
+  const d = (bytesToBig(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, seed)) % (P256.n - N1)) + N1;
   const pub = ecMul(d, [P256.gx, P256.gy]);
   const keys = {
     privateKey: d.toString(16),
@@ -763,23 +769,23 @@ function es256Sign(d, msgBytes) {
       Utilities.DigestAlgorithm.SHA_256,
       d.toString(16) + ':' + z.toString(16) + ':' + Utilities.getUuid() + ':' + Utilities.getUuid()
     )) % n;
-    if (k === 0n) continue;
+    if (k === N0) continue;
     const r = ecMul(k, [P256.gx, P256.gy])[0] % n;
-    if (r === 0n) continue;
+    if (r === N0) continue;
     const s = (modInv(k, n) * (z + r * d)) % n;
-    if (s === 0n) continue;
+    if (s === N0) continue;
     return bigToBytes(r).concat(bigToBytes(s));
   }
 }
 
 function mod(a, m) {
   const r = a % m;
-  return r < 0n ? r + m : r;
+  return r < N0 ? r + m : r;
 }
 
 function modInv(a, m) {
-  let [x0, x1, r0, r1] = [0n, 1n, m, mod(a, m)];
-  while (r1 !== 0n) {
+  let [x0, x1, r0, r1] = [N0, N1, m, mod(a, m)];
+  while (r1 !== N0) {
     const q = r0 / r1;
     [x0, x1] = [x1, x0 - q * x1];
     [r0, r1] = [r1, r0 - q * r1];
@@ -794,8 +800,8 @@ function ecAdd(P, Q) {
   if (!Q) return P;
   let l;
   if (P[0] === Q[0]) {
-    if (mod(P[1] + Q[1], p) === 0n) return null;
-    l = mod((3n * P[0] * P[0] + P256.a) * modInv(2n * P[1], p), p);
+    if (mod(P[1] + Q[1], p) === N0) return null;
+    l = mod((N3 * P[0] * P[0] + P256.a) * modInv(N2 * P[1], p), p);
   } else {
     l = mod((Q[1] - P[1]) * modInv(Q[0] - P[0], p), p);
   }
@@ -806,10 +812,10 @@ function ecAdd(P, Q) {
 function ecMul(k, P) {
   let R = null;
   let A = P;
-  while (k > 0n) {
-    if (k & 1n) R = ecAdd(R, A);
+  while (k > N0) {
+    if (k & N1) R = ecAdd(R, A);
     A = ecAdd(A, A);
-    k >>= 1n;
+    k >>= N1;
   }
   return R;
 }

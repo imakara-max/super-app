@@ -1,5 +1,5 @@
 // アプリ本体（同一オリジンの静的ファイル）だけをキャッシュする。Google API の通信はキャッシュしない。
-const CACHE = "today-v2";
+const CACHE = "today-v3";
 const SHELL = [
   "./",
   "./index.html",
@@ -24,12 +24,13 @@ self.addEventListener("activate", (event) => {
   );
 });
 
-// ネットワーク優先、オフライン時のみキャッシュを返す
+// ネットワーク優先、オフライン時のみキャッシュを返す。
+// GitHub Pages はファイルを 10 分間ブラウザにキャッシュさせるため、更新がすぐ届くよう no-cache で再検証する。
 self.addEventListener("fetch", (event) => {
   const req = event.request;
   if (req.method !== "GET" || new URL(req.url).origin !== self.location.origin) return;
   event.respondWith(
-    fetch(req)
+    fetch(req, { cache: "no-cache" })
       .then((res) => {
         const copy = res.clone();
         caches.open(CACHE).then((c) => c.put(req, copy));

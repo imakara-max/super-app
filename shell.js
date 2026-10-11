@@ -52,7 +52,13 @@
       body: JSON.stringify({ action, accessToken: token, ...extra }),
     });
     if (!res.ok) throw new Error(`サーバーエラー (${res.status})`);
-    const body = await res.json();
+    let body;
+    try {
+      body = await res.json();
+    } catch {
+      // Apps Script がエラーページ (HTML) を返したとき
+      throw new Error("サーバーから正しい応答がありません。Apps Script のデプロイ（新バージョン）を確認してください");
+    }
     if (body.error === "unauthorized") throw new NeedLogin("unauthorized");
     if (body.error === "unknown_action") throw new Error("サーバーのコードが古いようです（README の手順で更新してください）");
     if (body.error) throw new Error(body.message || body.error);

@@ -4,6 +4,7 @@
  * - 1 時間おきに (夜 22 時〜朝 7 時を除く) 受信トレイの新着を読み、OpenAI で要約・分類して保存しておく
  * - アプリ (GitHub Pages) からの依頼に応じて、一覧を返す・ゴミ箱へ移動する・元に戻す
  * - Notion の「タスク」「買い物リスト」の読み書きを中継する (Notion のキーをアプリに置かないため)
+ * - 要返信メールの着信や、朝の「今日が期限のタスク」を iPhone に通知する (Web Push)
  *
  * Web アプリは「全員 (匿名)」公開にしているが、すべてのリクエストで
  * Google のアクセストークンを検証し、このスクリプトの持ち主本人が
@@ -51,6 +52,8 @@ function doGet() {
 function doPost(e) {
   try {
     const req = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+    // 通知を受けた iPhone が中身を取りに来る。ログイン情報は無いので、登録時に渡した合言葉で確かめる
+    if (req.action === 'push.latest') return json(pushLatest(req.secret));
     verifyCaller(req.accessToken);
     switch (req.action) {
       case 'list':
@@ -79,6 +82,15 @@ function doPost(e) {
       case 'notion.restore':
         notionSetTrash(req.list, req.id, false);
         return json({ ok: true });
+      case 'push.key':
+        return json({ key: vapidKeys().publicKey });
+      case 'push.subscribe':
+        return json({ secret: pushSubscribe(req.subscription) });
+      case 'push.unsubscribe':
+        pushUnsubscribe(req.endpoint);
+        return json({ ok: true });
+      case 'push.test':
+        return json({ sent: notify('テスト通知', '通知の設定ができました', 'mail') });
       default:
         return json({ error: 'unknown_action' });
     }
@@ -136,16 +148,23 @@ function verifyCaller(token) {
 function scheduledCheck() {
   const hour = Number(Utilities.formatDate(new Date(), 'Asia/Tokyo', 'H'));
   if (hour >= QUIET_HOURS.from || hour < QUIET_HOURS.to) return;
-  processInbox();
+  const fresh = processInbox() || [];
+  try {
+    notifyNewMail(fresh);
+    notifyMorning(hour);
+  } catch (err) {
+    console.error(err); // 通知に失敗してもメールの処理は終わっている
+  }
 }
 
+// 戻り値: 今回はじめて AI が要約したメール (通知に使う)
 function processInbox() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(0)) {
     // 別の処理が実行中なら、その完了を待つだけにする
     lock.waitLock(240000);
     lock.releaseLock();
-    return;
+    return [];
   }
   try {
     const store = props();
@@ -187,6 +206,7 @@ function processInbox() {
       .filter((k) => k.indexOf('t:') === 0 && !keep.has(k))
       .forEach((k) => store.deleteProperty(k));
     store.setProperties(updates);
+    return pending.filter((it) => it.summary);
   } finally {
     lock.releaseLock();
   }
@@ -219,6 +239,7 @@ function readThread(id, prev) {
     item.summary = prev.summary;
     item.category = prev.category;
     item.needsReply = prev.needsReply;
+    item.due = prev.due || '';
   } else {
     const full = Gmail.Users.Messages.get('me', last.id, { format: 'full' });
     item.body = (extractText(full.payload) || item.snippet).slice(0, BODY_CHARS);
@@ -318,6 +339,7 @@ const TRIAGE_PROMPT = [
   '  広告 = 宣伝・セール・メールマガジン (gmailCategory が promotions のものは原則これ)',
   '  その他 = 上のどれにも当てはまらないもの',
   '- needsReply: 本人が返信・回答・提出・申し込みなどの対応をする必要がありそうなときだけ true。広告や自動送信の通知は false。',
+  '- due: 本人がする対応 (返信・提出・支払い・申し込みなど) に締切日があれば YYYY-MM-DD、無ければ空文字。年が書かれていなければ date (受信日) から判断する。',
 ].join('\n');
 
 const DIGEST_PROMPT = [
@@ -334,6 +356,7 @@ function summarize(batch) {
     from: it.from + ' <' + it.fromAddress + '>',
     subject: it.subject,
     gmailCategory: it.gmailCategory,
+    date: Utilities.formatDate(new Date(it.date), 'Asia/Tokyo', 'yyyy-MM-dd'),
     body: it.body || it.snippet,
   }));
   const schema = {
@@ -346,12 +369,13 @@ function summarize(batch) {
         items: {
           type: 'object',
           additionalProperties: false,
-          required: ['id', 'summary', 'category', 'needsReply'],
+          required: ['id', 'summary', 'category', 'needsReply', 'due'],
           properties: {
             id: { type: 'string' },
             summary: { type: 'string' },
             category: { type: 'string', enum: CATEGORIES },
             needsReply: { type: 'boolean' },
+            due: { type: 'string' },
           },
         },
       },
@@ -364,6 +388,7 @@ function summarize(batch) {
     it.summary = r.summary;
     it.category = CATEGORIES.indexOf(r.category) >= 0 ? r.category : 'その他';
     it.needsReply = !!r.needsReply;
+    it.due = /^\d{4}-\d{2}-\d{2}$/.test(r.due) ? r.due : '';
   });
 }
 
@@ -436,6 +461,7 @@ function loadState() {
         summary: it.summary || '',
         category: it.category || '',
         needsReply: !!it.needsReply,
+        due: it.due || '',
         snippet: it.snippet,
       };
     });
@@ -604,4 +630,208 @@ function notionFetch(method, path, body) {
     throw new Error('Notion API エラー ' + code + ': ' + res.getContentText().slice(0, 300));
   }
   return JSON.parse(res.getContentText());
+}
+
+// ---------- iPhone への通知 (Web Push) ----------
+//
+// ホーム画面に追加したアプリ (iOS 16.4 以降) に通知を送る。
+// 送るのは「中身の無いお知らせ」だけで、受け取った iPhone がこのサーバーに
+// 合言葉 (登録時に発行) 付きで最新の通知文を取りに来て表示する。
+// こうすると通知文の暗号化が要らず、Apps Script だけで送れる。
+
+const PUSH_MAX_SUBS = 5;
+
+// 新しく届いた要返信メールを知らせる
+function notifyNewMail(fresh) {
+  const reply = fresh.filter((it) => it.needsReply);
+  if (!reply.length) return;
+  const title = reply.length === 1 ? '要返信のメール: ' + reply[0].from : '要返信のメールが ' + reply.length + ' 件届きました';
+  notify(title, reply.map((it) => it.summary).join('\n'), 'mail');
+}
+
+// 朝いちばんのチェックで、今日が期限・期限切れのタスクを知らせる (1 日 1 回、昼前まで)
+function notifyMorning(hour) {
+  const today = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+  const store = props();
+  if (store.getProperty('push:morning') === today || !pushSubs().length) return;
+  store.setProperty('push:morning', today);
+  if (hour >= 10) return; // 朝のチェックが動かなかった日は、昼以降に遅れて知らせない
+  if (!store.getProperty('NOTION_TOKEN')) return;
+  const tasks = notionList('tasks').filter((t) => !t.done && t.due && t.due <= today);
+  if (!tasks.length) return;
+  const over = tasks.filter((t) => t.due < today).length;
+  const title = '今日が期限のタスク ' + (tasks.length - over) + ' 件' + (over ? '・期限切れ ' + over + ' 件' : '');
+  notify(title, tasks.map((t) => '・' + t.title).join('\n'), 'today');
+}
+
+// 通知文を保存し、登録済みの端末すべてに知らせる。戻り値: 送れた端末の数
+function notify(title, body, view) {
+  const subs = pushSubs();
+  if (!subs.length) return 0;
+  props().setProperty('push:latest', JSON.stringify({ title: title, body: body.slice(0, 500), view: view, at: Date.now() }));
+  const keys = vapidKeys();
+  let sent = 0;
+  const gone = [];
+  subs.forEach((sub) => {
+    const aud = sub.endpoint.match(/^https:\/\/[^/]+/)[0];
+    const jwt = vapidJwt(keys, aud);
+    const res = UrlFetchApp.fetch(sub.endpoint, {
+      method: 'post',
+      headers: { Authorization: 'vapid t=' + jwt + ', k=' + keys.publicKey, TTL: '43200', Urgency: 'high' },
+      payload: '',
+      muteHttpExceptions: true,
+    });
+    const code = res.getResponseCode();
+    if (code >= 200 && code < 300) sent++;
+    else if (code === 404 || code === 410) gone.push(sub.endpoint); // 通知をオフにした・アプリを消した
+    else console.error('通知を送れませんでした ' + code + ': ' + res.getContentText().slice(0, 200));
+  });
+  if (gone.length) savePushSubs(subs.filter((s) => gone.indexOf(s.endpoint) < 0));
+  return sent;
+}
+
+function pushLatest(secret) {
+  if (typeof secret !== 'string' || !pushSubs().some((s) => s.secret === secret)) return { error: 'unauthorized' };
+  const latest = props().getProperty('push:latest');
+  return latest ? JSON.parse(latest) : { title: 'スーパーアプリ', body: '', view: 'today' };
+}
+
+function pushSubs() {
+  return JSON.parse(props().getProperty('push:subs') || '[]');
+}
+
+function savePushSubs(subs) {
+  props().setProperty('push:subs', JSON.stringify(subs));
+}
+
+function pushSubscribe(subscription) {
+  const endpoint = subscription && subscription.endpoint;
+  if (typeof endpoint !== 'string' || !/^https:\/\/[^/\s]+\/\S+$/.test(endpoint) || endpoint.length > 1000) {
+    throw new Error('通知の登録情報が正しくありません');
+  }
+  const secret = Utilities.getUuid();
+  const subs = pushSubs().filter((s) => s.endpoint !== endpoint);
+  subs.push({ endpoint: endpoint, secret: secret, created: new Date().toISOString() });
+  savePushSubs(subs.slice(-PUSH_MAX_SUBS));
+  return secret;
+}
+
+function pushUnsubscribe(endpoint) {
+  savePushSubs(pushSubs().filter((s) => s.endpoint !== endpoint));
+}
+
+// ---------- VAPID (通知を送るサーバーの署名。P-256 の ECDSA を BigInt で実装) ----------
+
+// BigInt の数値リテラル (1n など) は Apps Script のエディタが構文エラーにするため、BigInt() で作る
+const N0 = BigInt(0);
+const N1 = BigInt(1);
+const N2 = BigInt(2);
+const N3 = BigInt(3);
+
+const P256 = {
+  p: BigInt('0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff'),
+  n: BigInt('0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551'),
+  a: BigInt('0xffffffff00000001000000000000000000000000fffffffffffffffffffffffc'),
+  gx: BigInt('0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296'),
+  gy: BigInt('0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5'),
+};
+
+// 鍵は初回に作ってスクリプト プロパティに保存する (作り直すと登録済みの端末に届かなくなる)
+function vapidKeys() {
+  const store = props();
+  const saved = store.getProperty('push:vapid');
+  if (saved) return JSON.parse(saved);
+  const seed = [Utilities.getUuid(), Utilities.getUuid(), Utilities.getUuid(), Utilities.getUuid(), Date.now()].join(':');
+  const d = (bytesToBig(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, seed)) % (P256.n - N1)) + N1;
+  const pub = ecMul(d, [P256.gx, P256.gy]);
+  const keys = {
+    privateKey: d.toString(16),
+    publicKey: b64url([4].concat(bigToBytes(pub[0]), bigToBytes(pub[1]))),
+  };
+  store.setProperty('push:vapid', JSON.stringify(keys));
+  return keys;
+}
+
+function vapidJwt(keys, aud) {
+  const enc = (o) => b64url(Utilities.newBlob(JSON.stringify(o)).getBytes());
+  const input =
+    enc({ typ: 'JWT', alg: 'ES256' }) + '.' +
+    enc({ aud: aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: 'mailto:' + ownerEmail() });
+  return input + '.' + b64url(es256Sign(BigInt('0x' + keys.privateKey), Utilities.newBlob(input).getBytes()));
+}
+
+function es256Sign(d, msgBytes) {
+  const n = P256.n;
+  const z = bytesToBig(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, msgBytes));
+  for (;;) {
+    // k は毎回ちがう乱数にする (同じ k を使うと秘密鍵が漏れる)
+    const k = bytesToBig(Utilities.computeDigest(
+      Utilities.DigestAlgorithm.SHA_256,
+      d.toString(16) + ':' + z.toString(16) + ':' + Utilities.getUuid() + ':' + Utilities.getUuid()
+    )) % n;
+    if (k === N0) continue;
+    const r = ecMul(k, [P256.gx, P256.gy])[0] % n;
+    if (r === N0) continue;
+    const s = (modInv(k, n) * (z + r * d)) % n;
+    if (s === N0) continue;
+    return bigToBytes(r).concat(bigToBytes(s));
+  }
+}
+
+function mod(a, m) {
+  const r = a % m;
+  return r < N0 ? r + m : r;
+}
+
+function modInv(a, m) {
+  let [x0, x1, r0, r1] = [N0, N1, m, mod(a, m)];
+  while (r1 !== N0) {
+    const q = r0 / r1;
+    [x0, x1] = [x1, x0 - q * x1];
+    [r0, r1] = [r1, r0 - q * r1];
+  }
+  return mod(x0, m);
+}
+
+// null は無限遠点
+function ecAdd(P, Q) {
+  const p = P256.p;
+  if (!P) return Q;
+  if (!Q) return P;
+  let l;
+  if (P[0] === Q[0]) {
+    if (mod(P[1] + Q[1], p) === N0) return null;
+    l = mod((N3 * P[0] * P[0] + P256.a) * modInv(N2 * P[1], p), p);
+  } else {
+    l = mod((Q[1] - P[1]) * modInv(Q[0] - P[0], p), p);
+  }
+  const x = mod(l * l - P[0] - Q[0], p);
+  return [x, mod(l * (P[0] - x) - P[1], p)];
+}
+
+function ecMul(k, P) {
+  let R = null;
+  let A = P;
+  while (k > N0) {
+    if (k & N1) R = ecAdd(R, A);
+    A = ecAdd(A, A);
+    k >>= N1;
+  }
+  return R;
+}
+
+// Apps Script のバイト列は -128〜127
+function bytesToBig(bytes) {
+  return BigInt('0x' + (bytes.map((b) => ('0' + (b & 0xff).toString(16)).slice(-2)).join('') || '0'));
+}
+
+function bigToBytes(x) {
+  const hex = x.toString(16).padStart(64, '0');
+  const out = [];
+  for (let i = 0; i < 64; i += 2) out.push(parseInt(hex.slice(i, i + 2), 16));
+  return out;
+}
+
+function b64url(bytes) {
+  return Utilities.base64EncodeWebSafe(bytes.map((b) => (b > 127 ? b - 256 : b))).replace(/=+$/, '');
 }

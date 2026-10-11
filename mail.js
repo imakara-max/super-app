@@ -7,6 +7,8 @@
   // 表示順。要返信は分類とは別に先頭へまとめる
   const SECTION_ORDER = ["学校・家族", "仕事", "お金・支払い", "買い物・配送", "お知らせ", "その他", "SNS", "広告"];
   const COLLAPSED = new Set(["SNS", "広告"]);
+  const KEY_TASKED = "superapp.mailTasks"; // タスクに追加したメール (スレッド ID) を覚えておく
+  const NO_TASK = new Set(["SNS", "広告"]); // 「タスクに追加」ボタンを出さない分類
 
   const $ = (id) => document.getElementById(id);
   const el = {
@@ -24,6 +26,10 @@
 
   let data = null; // { updatedAt, digest: string[], items: [...] }
   let busy = false;
+  let tasked = new Set();
+  try {
+    tasked = new Set(JSON.parse(localStorage.getItem(KEY_TASKED)) || []);
+  } catch { /* ignore */ }
   const openSections = new Set(); // 折りたたみ表示の開閉状態を再描画後も保つ
 
   const { callServer: call, NeedLogin, showToast } = window.SuperApp;
@@ -222,8 +228,67 @@
       '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6"/></svg>';
     del.addEventListener("click", () => trash(it));
 
-    li.append(link, del);
+    if (NO_TASK.has(it.category) && !it.needsReply) {
+      li.append(link, del);
+      return li;
+    }
+    const task = document.createElement("button");
+    task.type = "button";
+    task.className = "mail__delete mail__task";
+    const done = tasked.has(it.id);
+    if (done) task.classList.add("mail__task--done");
+    task.setAttribute("aria-label", done ? `「${it.subject}」はタスクに追加済み` : `「${it.subject}」をタスクに追加`);
+    task.innerHTML = done
+      ? '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 11l3 3 8-8"/><path d="M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h9"/></svg>'
+      : '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M12 8v8M8 12h8"/></svg>';
+    task.addEventListener("click", () => addTask(it, task));
+
+    li.append(link, task, del);
     return li;
+  }
+
+  // ---------- タスクに追加 ----------
+  function saveTasked() {
+    try {
+      localStorage.setItem(KEY_TASKED, JSON.stringify([...tasked].slice(-200)));
+    } catch { /* private mode */ }
+  }
+
+  async function addTask(it, button) {
+    if (tasked.has(it.id)) {
+      showToast("このメールはタスクに追加済みです");
+      return;
+    }
+    // AI の要約 (誰から・何の用件・締切) をタスク名にし、元のメールへのリンクをメモに残す
+    const item = {
+      title: (it.summary || it.subject).slice(0, 200),
+      memo: `メール: ${it.from}「${it.subject}」\n${gmailLink(it.id)}`,
+    };
+    if (it.due) item.due = it.due;
+    button.disabled = true;
+    try {
+      const res = await call("notion.create", { list: "tasks", item });
+      tasked.add(it.id);
+      saveTasked();
+      render();
+      const [, m, d] = (it.due || "").split("-").map(Number);
+      showToast(it.due ? `タスクに追加しました（期限 ${m}/${d}）` : "タスクに追加しました", () => removeTask(it, res.item.id));
+    } catch (e) {
+      button.disabled = false;
+      showToast(e instanceof NeedLogin ? "ログインし直してから、もう一度お試しください" : `追加できませんでした: ${e.message}`);
+    }
+  }
+
+  async function removeTask(it, taskId) {
+    try {
+      await call("notion.delete", { list: "tasks", id: taskId });
+      tasked.delete(it.id);
+      saveTasked();
+      render();
+      showToast("取り消しました");
+    } catch {
+      showToast("取り消せませんでした。タスクタブから削除してください");
+    }
   }
 
   function gmailLink(threadId) {

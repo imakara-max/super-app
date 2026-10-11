@@ -324,18 +324,34 @@
     el.tabs.hidden = false;
   }
 
-  function renderEvents({ range, groups, count, shown, total, failed }) {
+  // 未完了で、その日が期限のタスク。今日の欄には期限切れのものも出す
+  function tasksForDay(tasks, day) {
+    const date = localISO(day.start);
+    const today = localISO(new Date());
+    return (tasks || [])
+      .filter((t) => !t.done && t.due && (t.due === date || (date === today && t.due < today)))
+      .sort((a, b) => a.due.localeCompare(b.due));
+  }
+
+  function localISO(d) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }
+
+  function renderEvents({ range, groups, count, shown, total, failed }, tasks) {
     showMain();
     setStatus("");
 
+    const dayTasks = groups.map((g) => tasksForDay(tasks, g));
+    const taskCount = dayTasks.flat().length;
     const email = store.get(KEY_EMAIL);
     const calText = shown === total ? `${total} カレンダー` : `${shown}/${total} カレンダー`;
     const parts = [email, calText, `${count} 件`].filter(Boolean);
+    if (taskCount) parts.push(`期限のタスク ${taskCount} 件`);
     if (failed) parts.push(`${failed} カレンダーは読み込めませんでした`);
     el.account.textContent = parts.join(" ・ ");
     el.account.hidden = false;
 
-    if (count === 0) {
+    if (count === 0 && !taskCount) {
       const li = document.createElement("li");
       li.className = "card empty";
       li.textContent = shown === 0 ? "表示するカレンダーが選ばれていません（右上の設定ボタンから選べます）" : RANGES[range].empty;
@@ -345,8 +361,8 @@
 
     const multiDay = groups.length > 1;
     el.events.replaceChildren(
-      ...groups.flatMap((g) => {
-        const items = g.events.map(renderEvent);
+      ...groups.flatMap((g, i) => {
+        const items = [...dayTasks[i].map(renderTask), ...g.events.map(renderEvent)];
         if (!multiDay) return items;
         const head = document.createElement("li");
         head.className = "day";
@@ -406,6 +422,43 @@
 
     a.append(bar, time, body);
     li.append(a);
+    return li;
+  }
+
+  // 期限のあるタスク。タップでタスク画面へ
+  function renderTask(t) {
+    const li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "event event--task";
+    const over = t.due < localISO(new Date());
+    if (over) btn.classList.add("event--over");
+
+    const bar = document.createElement("span");
+    bar.className = "event__bar";
+
+    const time = document.createElement("div");
+    time.className = "event__time";
+    time.textContent = over ? "期限切れ" : "期限";
+    if (over) {
+      const small = document.createElement("small");
+      small.textContent = shortDayFmt.format(parseDate(t.due));
+      time.append(small);
+    }
+
+    const body = document.createElement("div");
+    body.className = "event__body";
+    const title = document.createElement("p");
+    title.className = "event__title";
+    title.textContent = t.title;
+    const meta = document.createElement("p");
+    meta.className = "event__meta";
+    meta.textContent = ["タスク", t.priority && `優先度 ${t.priority}`].filter(Boolean).join(" ・ ");
+    body.append(title, meta);
+
+    btn.append(bar, time, body);
+    btn.addEventListener("click", () => window.SuperApp.showView("tasks"));
+    li.append(btn);
     return li;
   }
 
@@ -492,7 +545,14 @@
       await loadEmail();
       const result = await fetchEvents(currentRange());
       // タブを素早く切り替えた場合は、最後に選んだ範囲の結果だけを表示する
-      if (seq === requestSeq) renderEvents(result);
+      if (seq !== requestSeq) return;
+      // タスクは前回の内容ですぐ出し、Notion から届いたら描き直す (読めなくても予定は出す)
+      renderEvents(result, window.SuperApp.cachedTasks());
+      if (window.SuperApp.serverUrl) {
+        window.SuperApp.fetchTasks()
+          .then((tasks) => seq === requestSeq && el.settings.hidden && renderEvents(result, tasks))
+          .catch(() => {});
+      }
     } catch (e) {
       if (seq !== requestSeq) return;
       if (e instanceof ScopeError) {
@@ -553,6 +613,14 @@
     signIn: () => startAuth({ reconsent: needsReconsent }),
     email: () => store.get(KEY_EMAIL),
     loadEmail: () => loadEmail().catch(() => {}),
+    // 今日の画面 (today.js) で使う
+    fetchTodayEvents: async () => {
+      await loadEmail();
+      return (await fetchEvents("today")).groups[0].events;
+    },
+    renderEvent,
+    renderTask,
+    isAuthError: (e) => e instanceof AuthError || e instanceof ScopeError,
   });
 
   if ("serviceWorker" in navigator) {

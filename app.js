@@ -50,7 +50,7 @@
 
   // ---------- OAuth (implicit flow / redirect) ----------
   // iOS のホーム画面アプリではポップアップが不安定なため、リダイレクト方式で認可する。
-  function startAuth({ silent = false } = {}) {
+  function startAuth({ silent = false, reconsent = false } = {}) {
     const state = crypto.getRandomValues(new Uint32Array(4)).join("-");
     store.set(KEY_STATE, state);
     const params = new URLSearchParams({
@@ -67,7 +67,7 @@
       params.set("prompt", "none");
       store.set(KEY_SILENT, Date.now());
     } else {
-      params.set("prompt", "select_account");
+      params.set("prompt", reconsent ? "consent select_account" : "select_account");
     }
     location.assign("https://accounts.google.com/o/oauth2/v2/auth?" + params);
   }
@@ -124,6 +124,7 @@
 
   // ---------- Google API ----------
   class AuthError extends Error {}
+  class ScopeError extends Error {}
 
   async function api(url) {
     const token = validToken();
@@ -132,6 +133,13 @@
     if (res.status === 401) {
       store.del(KEY_TOKEN);
       throw new AuthError("unauthorized");
+    }
+    if (res.status === 403) {
+      const body = await res.json().catch(() => ({}));
+      const reasons = ((body.error && body.error.errors) || []).map((e) => e.reason);
+      if (reasons.includes("insufficientPermissions") || /scope/i.test((body.error && body.error.message) || "")) {
+        throw new ScopeError("insufficient scope");
+      }
     }
     if (!res.ok) throw new Error(`API エラー (${res.status})`);
     return res.json();
@@ -147,8 +155,10 @@
     const list = await api(
       "https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=reader&maxResults=250"
     );
-    // Google カレンダー上で表示中（チェックが入っている）のカレンダーだけを対象にする
-    const calendars = (list.items || []).filter((c) => c.selected && !c.hidden);
+    // 登録済みのカレンダーをすべて対象にする（リストから非表示にしたものは除く）。
+    // selected (Web 版の表示チェック) はスマホアプリ中心の使い方だと付かないことがあるため見ない。
+    const calendars = (list.items || []).filter((c) => !c.hidden && !c.deleted);
+    let failed = 0;
 
     const results = await Promise.all(
       calendars.map(async (cal) => {
@@ -166,17 +176,19 @@
           );
           return (data.items || []).map((ev) => ({ ev, cal }));
         } catch (e) {
-          if (e instanceof AuthError) throw e;
+          if (e instanceof AuthError || e instanceof ScopeError) throw e;
+          failed++;
           return []; // 1 つのカレンダーが失敗しても他は表示する
         }
       })
     );
 
-    return results
+    const events = results
       .flat()
       .filter(({ ev, cal }) => ev.status !== "cancelled" && !declinedByMe(ev, cal))
       .map(({ ev, cal }) => normalize(ev, cal))
       .sort((a, b) => (a.allDay !== b.allDay ? (a.allDay ? -1 : 1) : a.start - b.start));
+    return { events, calendarCount: calendars.length, failed };
   }
 
   function declinedByMe(ev, cal) {
@@ -233,13 +245,15 @@
     el.installHint.hidden = standalone || !/iPhone|iPad/.test(navigator.userAgent);
   }
 
-  function renderEvents(events) {
+  function renderEvents({ events, calendarCount, failed }) {
     el.login.hidden = true;
     el.actions.hidden = false;
     setStatus("");
 
     const email = store.get(KEY_EMAIL);
-    el.account.textContent = email ? `${email} ・ ${events.length} 件` : `${events.length} 件`;
+    const parts = [email, `${calendarCount} カレンダー`, `${events.length} 件`].filter(Boolean);
+    if (failed) parts.push(`${failed} カレンダーは読み込めませんでした`);
+    el.account.textContent = parts.join(" ・ ");
     el.account.hidden = false;
 
     if (events.length === 0) {
@@ -302,6 +316,7 @@
 
   // ---------- main ----------
   let loading = false;
+  let needsReconsent = false;
 
   async function loadEmail() {
     if (store.get(KEY_EMAIL)) return;
@@ -326,7 +341,10 @@
       await loadEmail();
       renderEvents(await fetchTodayEvents());
     } catch (e) {
-      if (e instanceof AuthError) {
+      if (e instanceof ScopeError) {
+        needsReconsent = true;
+        showLogin("カレンダーへのアクセスが許可されていません。もう一度ログインし、確認画面でカレンダーの項目にチェックを入れてください。");
+      } else if (e instanceof AuthError) {
         if (!trySilentReauth()) showLogin("ログインの有効期限が切れました。もう一度ログインしてください。");
       } else {
         setStatus(navigator.onLine ? e.message : "オフラインです。接続を確認してください。", true);
@@ -345,7 +363,7 @@
       return;
     }
 
-    el.loginBtn.addEventListener("click", () => startAuth());
+    el.loginBtn.addEventListener("click", () => startAuth({ reconsent: needsReconsent }));
     el.refresh.addEventListener("click", refresh);
     el.logout.addEventListener("click", logout);
     // ホーム画面アプリに戻ってきたとき（日付が変わった場合も含む）に最新化する

@@ -14,10 +14,20 @@
   const KEY_STATE = "today.oauthState";
   const KEY_EMAIL = "today.email";
   const KEY_SILENT = "today.silentTriedAt";
+  const KEY_RANGE = "today.range";
+  const KEY_HIDDEN_CALS = "today.hiddenCalendars";
 
   const $ = (id) => document.getElementById(id);
   const el = {
     date: $("date"),
+    title: $("title"),
+    tabs: $("tabs"),
+    settingsBtn: $("settings-btn"),
+    settings: $("settings"),
+    calendarList: $("calendar-list"),
+    selectAll: $("select-all"),
+    selectNone: $("select-none"),
+    settingsDone: $("settings-done"),
     actions: $("actions"),
     refresh: $("refresh"),
     logout: $("logout"),
@@ -145,29 +155,70 @@
     return res.json();
   }
 
-  async function fetchTodayEvents() {
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(start);
-    end.setDate(end.getDate() + 1);
-    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  // ---------- 表示範囲 ----------
+  const RANGES = {
+    today: { title: "きょうの予定", empty: "今日の予定はありません 🎉", offset: 0, days: 1 },
+    tomorrow: { title: "あしたの予定", empty: "明日の予定はありません", offset: 1, days: 1 },
+    week: { title: "今週の予定", empty: "この 7 日間の予定はありません", offset: 0, days: 7 },
+  };
 
+  function currentRange() {
+    const r = store.get(KEY_RANGE);
+    return RANGES[r] ? r : "today";
+  }
+
+  function rangeDays(range) {
+    const { offset, days } = RANGES[range];
+    const first = new Date();
+    first.setHours(0, 0, 0, 0);
+    first.setDate(first.getDate() + offset);
+    return Array.from({ length: days }, (_, i) => {
+      const start = new Date(first);
+      start.setDate(start.getDate() + i);
+      const end = new Date(start);
+      end.setDate(end.getDate() + 1);
+      return { start, end };
+    });
+  }
+
+  // ---------- カレンダーの表示設定 ----------
+  // 非表示にしたカレンダーの ID を保存する（新しく追加されたカレンダーは自動的に表示される）
+  function hiddenCalendarIds() {
+    return new Set(store.get(KEY_HIDDEN_CALS) || []);
+  }
+
+  let calendars = [];
+
+  async function fetchCalendars() {
     const list = await api(
       "https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=reader&maxResults=250"
     );
-    // 登録済みのカレンダーをすべて対象にする（リストから非表示にしたものは除く）。
+    // 登録済みのカレンダーをすべて候補にする（リストから非表示にしたものは除く）。
     // selected (Web 版の表示チェック) はスマホアプリ中心の使い方だと付かないことがあるため見ない。
-    const calendars = (list.items || []).filter((c) => !c.hidden && !c.deleted);
+    calendars = (list.items || [])
+      .filter((c) => !c.hidden && !c.deleted)
+      .sort((a, b) => (a.primary ? -1 : b.primary ? 1 : 0));
+    return calendars;
+  }
+
+  async function fetchEvents(range) {
+    const days = rangeDays(range);
+    const timeMin = days[0].start;
+    const timeMax = days[days.length - 1].end;
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+    const hidden = hiddenCalendarIds();
+    const targets = (await fetchCalendars()).filter((c) => !hidden.has(c.id));
     let failed = 0;
 
     const results = await Promise.all(
-      calendars.map(async (cal) => {
+      targets.map(async (cal) => {
         const params = new URLSearchParams({
-          timeMin: start.toISOString(),
-          timeMax: end.toISOString(),
+          timeMin: timeMin.toISOString(),
+          timeMax: timeMax.toISOString(),
           singleEvents: "true",
           orderBy: "startTime",
-          maxResults: "100",
+          maxResults: "250",
           timeZone,
         });
         try {
@@ -186,9 +237,17 @@
     const events = results
       .flat()
       .filter(({ ev, cal }) => ev.status !== "cancelled" && !declinedByMe(ev, cal))
-      .map(({ ev, cal }) => normalize(ev, cal))
-      .sort((a, b) => (a.allDay !== b.allDay ? (a.allDay ? -1 : 1) : a.start - b.start));
-    return { events, calendarCount: calendars.length, failed };
+      .map(({ ev, cal }) => normalize(ev, cal));
+
+    // 日ごとに振り分ける（複数日にまたがる予定は該当する日すべてに出す）
+    const groups = days.map((day) => ({
+      ...day,
+      events: events
+        .filter((e) => e.start < day.end && e.end > day.start)
+        .sort((a, b) => (a.allDay !== b.allDay ? (a.allDay ? -1 : 1) : a.start - b.start)),
+    }));
+    const count = new Set(groups.flatMap((g) => g.events)).size;
+    return { range, groups, count, shown: targets.length, total: calendars.length, failed };
   }
 
   function declinedByMe(ev, cal) {
@@ -203,13 +262,17 @@
     return {
       title: ev.summary || "(タイトルなし)",
       location: ev.location || "",
-      calendar: cal.summaryOverride || cal.summary || "",
+      calendar: calendarName(cal),
       color: cal.backgroundColor || "",
       link: ev.htmlLink || "",
       allDay,
       start,
       end,
     };
+  }
+
+  function calendarName(cal) {
+    return cal.summaryOverride || cal.summary || "";
   }
 
   // "YYYY-MM-DD" をローカル時刻の 0:00 として解釈する
@@ -220,13 +283,20 @@
 
   // ---------- rendering ----------
   const timeFmt = new Intl.DateTimeFormat("ja-JP", { hour: "2-digit", minute: "2-digit" });
+  const dayFmt = new Intl.DateTimeFormat("ja-JP", { month: "long", day: "numeric", weekday: "long" });
+  const shortDayFmt = new Intl.DateTimeFormat("ja-JP", { month: "numeric", day: "numeric", weekday: "short" });
 
-  function renderDate() {
-    el.date.textContent = new Intl.DateTimeFormat("ja-JP", {
-      month: "long",
-      day: "numeric",
-      weekday: "long",
-    }).format(new Date());
+  function renderHeader() {
+    const range = currentRange();
+    const days = rangeDays(range);
+    el.title.textContent = RANGES[range].title;
+    el.date.textContent =
+      days.length === 1
+        ? dayFmt.format(days[0].start)
+        : `${shortDayFmt.format(days[0].start)} 〜 ${shortDayFmt.format(days[days.length - 1].start)}`;
+    for (const tab of el.tabs.querySelectorAll("[data-range]")) {
+      tab.setAttribute("aria-pressed", String(tab.dataset.range === range));
+    }
   }
 
   function setStatus(text, isError = false) {
@@ -238,6 +308,8 @@
   function showLogin(message) {
     el.login.hidden = false;
     el.actions.hidden = true;
+    el.tabs.hidden = true;
+    el.settings.hidden = true;
     el.account.hidden = true;
     el.events.replaceChildren();
     setStatus(message || "", !!message);
@@ -245,77 +317,155 @@
     el.installHint.hidden = standalone || !/iPhone|iPad/.test(navigator.userAgent);
   }
 
-  function renderEvents({ events, calendarCount, failed }) {
+  function showMain() {
     el.login.hidden = true;
     el.actions.hidden = false;
+    el.tabs.hidden = false;
+  }
+
+  function renderEvents({ range, groups, count, shown, total, failed }) {
+    showMain();
     setStatus("");
 
     const email = store.get(KEY_EMAIL);
-    const parts = [email, `${calendarCount} カレンダー`, `${events.length} 件`].filter(Boolean);
+    const calText = shown === total ? `${total} カレンダー` : `${shown}/${total} カレンダー`;
+    const parts = [email, calText, `${count} 件`].filter(Boolean);
     if (failed) parts.push(`${failed} カレンダーは読み込めませんでした`);
     el.account.textContent = parts.join(" ・ ");
     el.account.hidden = false;
 
-    if (events.length === 0) {
+    if (count === 0) {
       const li = document.createElement("li");
       li.className = "card empty";
-      li.textContent = "今日の予定はありません 🎉";
+      li.textContent = shown === 0 ? "表示するカレンダーが選ばれていません（右上の設定ボタンから選べます）" : RANGES[range].empty;
       el.events.replaceChildren(li);
       return;
     }
 
-    const now = Date.now();
+    const multiDay = groups.length > 1;
     el.events.replaceChildren(
-      ...events.map((e) => {
+      ...groups.flatMap((g) => {
+        const items = g.events.map(renderEvent);
+        if (!multiDay) return items;
+        const head = document.createElement("li");
+        head.className = "day";
+        head.textContent = dayFmt.format(g.start);
+        if (!items.length) {
+          const none = document.createElement("li");
+          none.className = "day__none";
+          none.textContent = "予定なし";
+          items.push(none);
+        }
+        return [head, ...items];
+      })
+    );
+  }
+
+  function renderEvent(e) {
+    const now = Date.now();
+    const li = document.createElement("li");
+    const a = document.createElement(e.link ? "a" : "div");
+    a.className = "event";
+    if (e.link) {
+      a.href = e.link;
+      a.target = "_blank";
+      a.rel = "noopener";
+    }
+    if (!e.allDay && e.end <= now) a.classList.add("past");
+    if (!e.allDay && e.start <= now && now < e.end) a.classList.add("now");
+
+    const bar = document.createElement("span");
+    bar.className = "event__bar";
+    if (e.color) bar.style.background = e.color;
+
+    const time = document.createElement("div");
+    time.className = "event__time";
+    if (e.allDay) {
+      time.textContent = "終日";
+    } else {
+      time.textContent = timeFmt.format(e.start);
+      const small = document.createElement("small");
+      small.textContent = timeFmt.format(e.end);
+      time.append(small);
+    }
+
+    const body = document.createElement("div");
+    body.className = "event__body";
+    const title = document.createElement("p");
+    title.className = "event__title";
+    title.textContent = e.title;
+    body.append(title);
+    const meta = [e.location, e.calendar].filter(Boolean).join(" ・ ");
+    if (meta) {
+      const p = document.createElement("p");
+      p.className = "event__meta";
+      p.textContent = meta;
+      body.append(p);
+    }
+
+    a.append(bar, time, body);
+    li.append(a);
+    return li;
+  }
+
+  // ---------- 設定画面 ----------
+  async function openSettings() {
+    el.settings.hidden = false;
+    el.events.hidden = true;
+    el.account.hidden = true;
+    el.tabs.hidden = true;
+    setStatus("");
+    if (!calendars.length) {
+      try {
+        await fetchCalendars();
+      } catch {
+        setStatus("カレンダーの一覧を読み込めませんでした。", true);
+      }
+    }
+    renderCalendarList();
+  }
+
+  function renderCalendarList() {
+    const hidden = hiddenCalendarIds();
+    el.calendarList.replaceChildren(
+      ...calendars.map((cal) => {
         const li = document.createElement("li");
-        const a = document.createElement(e.link ? "a" : "div");
-        a.className = "event";
-        if (e.link) {
-          a.href = e.link;
-          a.target = "_blank";
-          a.rel = "noopener";
-        }
-        if (!e.allDay && e.end <= now) a.classList.add("past");
-        if (!e.allDay && e.start <= now && now < e.end) a.classList.add("now");
-
-        const bar = document.createElement("span");
-        bar.className = "event__bar";
-        if (e.color) bar.style.background = e.color;
-
-        const time = document.createElement("div");
-        time.className = "event__time";
-        if (e.allDay) {
-          time.textContent = "終日";
-        } else {
-          time.textContent = timeFmt.format(e.start);
-          const small = document.createElement("small");
-          small.textContent = timeFmt.format(e.end);
-          time.append(small);
-        }
-
-        const body = document.createElement("div");
-        body.className = "event__body";
-        const title = document.createElement("p");
-        title.className = "event__title";
-        title.textContent = e.title;
-        body.append(title);
-        const meta = [e.location, e.calendar].filter(Boolean).join(" ・ ");
-        if (meta) {
-          const p = document.createElement("p");
-          p.className = "event__meta";
-          p.textContent = meta;
-          body.append(p);
-        }
-
-        a.append(bar, time, body);
-        li.append(a);
+        const label = document.createElement("label");
+        label.className = "cal-option";
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.checked = !hidden.has(cal.id);
+        box.addEventListener("change", () => {
+          const h = hiddenCalendarIds();
+          if (box.checked) h.delete(cal.id);
+          else h.add(cal.id);
+          store.set(KEY_HIDDEN_CALS, [...h]);
+        });
+        const swatch = document.createElement("span");
+        swatch.className = "cal-option__swatch";
+        if (cal.backgroundColor) swatch.style.background = cal.backgroundColor;
+        const name = document.createElement("span");
+        name.textContent = calendarName(cal) + (cal.primary ? "（メイン）" : "");
+        label.append(box, swatch, name);
+        li.append(label);
         return li;
       })
     );
   }
 
+  function setAllCalendars(visible) {
+    store.set(KEY_HIDDEN_CALS, visible ? [] : calendars.map((c) => c.id));
+    renderCalendarList();
+  }
+
+  function closeSettings() {
+    el.settings.hidden = true;
+    el.events.hidden = false;
+    refresh();
+  }
+
   // ---------- main ----------
-  let loading = false;
+  let requestSeq = 0;
   let needsReconsent = false;
 
   async function loadEmail() {
@@ -329,18 +479,21 @@
   }
 
   async function refresh() {
-    if (loading) return;
-    renderDate();
+    if (!el.settings.hidden) return;
+    renderHeader();
     if (!validToken()) {
       if (!trySilentReauth()) showLogin();
       return;
     }
-    loading = true;
+    const seq = ++requestSeq;
     if (!el.events.children.length) setStatus("読み込み中…");
     try {
       await loadEmail();
-      renderEvents(await fetchTodayEvents());
+      const result = await fetchEvents(currentRange());
+      // タブを素早く切り替えた場合は、最後に選んだ範囲の結果だけを表示する
+      if (seq === requestSeq) renderEvents(result);
     } catch (e) {
+      if (seq !== requestSeq) return;
       if (e instanceof ScopeError) {
         needsReconsent = true;
         showLogin("カレンダーへのアクセスが許可されていません。もう一度ログインし、確認画面でカレンダーの項目にチェックを入れてください。");
@@ -349,13 +502,11 @@
       } else {
         setStatus(navigator.onLine ? e.message : "オフラインです。接続を確認してください。", true);
       }
-    } finally {
-      loading = false;
     }
   }
 
   function init() {
-    renderDate();
+    renderHeader();
 
     if (!CLIENT_ID || CLIENT_ID.startsWith("YOUR_")) {
       showLogin("config.js に Google OAuth クライアント ID を設定してください。");
@@ -366,6 +517,18 @@
     el.loginBtn.addEventListener("click", () => startAuth({ reconsent: needsReconsent }));
     el.refresh.addEventListener("click", refresh);
     el.logout.addEventListener("click", logout);
+    el.settingsBtn.addEventListener("click", openSettings);
+    el.settingsDone.addEventListener("click", closeSettings);
+    el.selectAll.addEventListener("click", () => setAllCalendars(true));
+    el.selectNone.addEventListener("click", () => setAllCalendars(false));
+    el.tabs.addEventListener("click", (ev) => {
+      const tab = ev.target.closest("[data-range]");
+      if (!tab || tab.dataset.range === currentRange()) return;
+      store.set(KEY_RANGE, tab.dataset.range);
+      el.events.replaceChildren();
+      el.account.hidden = true;
+      refresh();
+    });
     // ホーム画面アプリに戻ってきたとき（日付が変わった場合も含む）に最新化する
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") refresh();

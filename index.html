@@ -18,13 +18,20 @@
   <header class="header">
     <div>
       <p class="header__date" id="date"></p>
-      <h1 class="header__title">きょうの予定</h1>
+      <h1 class="header__title" id="title">きょうの予定</h1>
     </div>
     <div class="header__actions" id="actions" hidden>
+      <button class="icon-btn" id="settings-btn" type="button" aria-label="表示するカレンダー"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="9" cy="6" r="2" fill="currentColor"/><circle cx="15" cy="12" r="2" fill="currentColor"/><circle cx="7" cy="18" r="2" fill="currentColor"/></svg></button>
       <button class="icon-btn" id="refresh" type="button" aria-label="再読み込み"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg></button>
       <button class="icon-btn" id="logout" type="button" aria-label="ログアウト"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg></button>
     </div>
   </header>
+
+  <nav class="tabs" id="tabs" aria-label="表示する期間" hidden>
+    <button type="button" data-range="today" aria-pressed="true">今日</button>
+    <button type="button" data-range="tomorrow" aria-pressed="false">明日</button>
+    <button type="button" data-range="week" aria-pressed="false">今週</button>
+  </nav>
 
   <main class="main">
     <section class="card login" id="login" hidden>
@@ -36,6 +43,16 @@
       <p class="hint" id="install-hint" hidden>
         Safari の共有ボタン → 「ホーム画面に追加」でアプリとして使えます。
       </p>
+    </section>
+
+    <section class="card settings" id="settings" hidden>
+      <h2 class="settings__title">表示するカレンダー</h2>
+      <div class="settings__bulk">
+        <button type="button" class="link-btn" id="select-all">すべて選択</button>
+        <button type="button" class="link-btn" id="select-none">すべて解除</button>
+      </div>
+      <ul class="cal-list" id="calendar-list"></ul>
+      <button type="button" class="primary-btn" id="settings-done">完了</button>
     </section>
 
     <p class="status" id="status" hidden></p>

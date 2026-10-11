@@ -236,3 +236,31 @@ body { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
 .sheet__actions { display: flex; align-items: center; gap: 16px; margin-top: 4px; }
 .sheet__delete { color: var(--danger); margin-right: auto; }
 .sheet__save { width: auto; padding: 10px 24px; }
+
+/* メール: タスクに追加 */
+.mail__task { width: 44px; }
+.mail__task:active { color: var(--accent); }
+.mail__task--done { color: var(--accent); }
+
+/* 予定タブ: 期限のタスク */
+.event--task { width: 100%; border: none; font: inherit; text-align: left; }
+.event--task .event__bar { background: var(--muted); }
+.event--over .event__bar { background: var(--danger); }
+.event--over .event__time { color: var(--danger); }
+
+/* 今日 */
+.today-block { margin-bottom: 20px; }
+.today-block__head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  margin: 0; padding: 4px 4px 8px; font-size: 15px; font-weight: 700;
+}
+.today-block__head .link-btn { font-size: 13px; font-weight: 500; }
+.today-block__status { margin: 0 4px 8px; color: var(--muted); font-size: 14px; }
+.today-block__status.error { color: var(--danger); }
+.today-empty { padding: 16px 20px; font-size: 14px; }
+.today-reply { display: block; margin-top: 8px; color: var(--danger); font-weight: 600; }
+.notify { margin-bottom: 20px; text-align: center; }
+.notify__text { margin: 0 0 12px; line-height: 1.6; font-size: 14px; }
+.notify__later { margin-top: 8px; color: var(--muted); }
+.push-footer { display: flex; justify-content: center; align-items: baseline; gap: 16px; margin: 8px 0 0; color: var(--muted); font-size: 13px; }
+.push-footer .link-btn { font-size: 13px; }

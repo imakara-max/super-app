@@ -1,0 +1,368 @@
+(() => {
+  "use strict";
+
+  const CLIENT_ID = window.APP_CONFIG && window.APP_CONFIG.GOOGLE_CLIENT_ID;
+  const SCOPES = [
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "openid",
+    "email",
+  ].join(" ");
+  // ホーム画面から起動した場合でもリダイレクト後に戻ってこられるよう、同じ URL に戻す
+  const REDIRECT_URI = location.origin + location.pathname;
+
+  const KEY_TOKEN = "today.token";
+  const KEY_STATE = "today.oauthState";
+  const KEY_EMAIL = "today.email";
+  const KEY_SILENT = "today.silentTriedAt";
+
+  const $ = (id) => document.getElementById(id);
+  const el = {
+    date: $("date"),
+    actions: $("actions"),
+    refresh: $("refresh"),
+    logout: $("logout"),
+    login: $("login"),
+    loginBtn: $("login-btn"),
+    installHint: $("install-hint"),
+    status: $("status"),
+    account: $("account"),
+    events: $("events"),
+  };
+
+  // ---------- storage ----------
+  const store = {
+    get(key) {
+      try { return JSON.parse(localStorage.getItem(key)); } catch { return null; }
+    },
+    set(key, value) {
+      try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* private mode */ }
+    },
+    del(key) {
+      try { localStorage.removeItem(key); } catch { /* private mode */ }
+    },
+  };
+
+  function validToken() {
+    const t = store.get(KEY_TOKEN);
+    // 期限の 1 分前には期限切れとして扱う
+    return t && t.accessToken && t.expiresAt - 60_000 > Date.now() ? t.accessToken : null;
+  }
+
+  // ---------- OAuth (implicit flow / redirect) ----------
+  // iOS のホーム画面アプリではポップアップが不安定なため、リダイレクト方式で認可する。
+  function startAuth({ silent = false } = {}) {
+    const state = crypto.getRandomValues(new Uint32Array(4)).join("-");
+    store.set(KEY_STATE, state);
+    const params = new URLSearchParams({
+      client_id: CLIENT_ID,
+      redirect_uri: REDIRECT_URI,
+      response_type: "token",
+      scope: SCOPES,
+      include_granted_scopes: "true",
+      state,
+    });
+    const email = store.get(KEY_EMAIL);
+    if (email) params.set("login_hint", email);
+    if (silent) {
+      params.set("prompt", "none");
+      store.set(KEY_SILENT, Date.now());
+    } else {
+      params.set("prompt", "select_account");
+    }
+    location.assign("https://accounts.google.com/o/oauth2/v2/auth?" + params);
+  }
+
+  // リダイレクトで戻ってきたときの URL フラグメントを処理する。
+  // 戻り値: "ok" | "silent_failed" | "error" | null (フラグメントなし)
+  function handleRedirect() {
+    if (!location.hash || location.hash.length < 2) return null;
+    const p = new URLSearchParams(location.hash.slice(1));
+    if (!p.has("access_token") && !p.has("error")) return null;
+
+    history.replaceState(null, "", location.pathname + location.search);
+    const expected = store.get(KEY_STATE);
+    store.del(KEY_STATE);
+    if (!expected || p.get("state") !== expected) return "error";
+    if (p.has("error")) {
+      // prompt=none で再ログインが必要と判定された場合は、通常のログイン画面を出すだけにする
+      const silentErrors = ["interaction_required", "login_required", "consent_required"];
+      return silentErrors.includes(p.get("error")) ? "silent_failed" : "error";
+    }
+
+    store.set(KEY_TOKEN, {
+      accessToken: p.get("access_token"),
+      expiresAt: Date.now() + Number(p.get("expires_in") || 3600) * 1000,
+    });
+    store.del(KEY_SILENT);
+    return "ok";
+  }
+
+  // トークン切れ時、以前ログインしていれば画面操作なしで再取得を試みる（1 分以内の連続試行はしない）
+  function trySilentReauth() {
+    const email = store.get(KEY_EMAIL);
+    const last = store.get(KEY_SILENT) || 0;
+    if (email && Date.now() - last > 60_000) {
+      startAuth({ silent: true });
+      return true;
+    }
+    return false;
+  }
+
+  async function logout() {
+    const token = validToken();
+    store.del(KEY_TOKEN);
+    store.del(KEY_EMAIL);
+    store.del(KEY_SILENT);
+    if (token) {
+      fetch("https://oauth2.googleapis.com/revoke?token=" + encodeURIComponent(token), {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      }).catch(() => {});
+    }
+    showLogin();
+  }
+
+  // ---------- Google API ----------
+  class AuthError extends Error {}
+
+  async function api(url) {
+    const token = validToken();
+    if (!token) throw new AuthError("no token");
+    const res = await fetch(url, { headers: { Authorization: "Bearer " + token } });
+    if (res.status === 401) {
+      store.del(KEY_TOKEN);
+      throw new AuthError("unauthorized");
+    }
+    if (!res.ok) throw new Error(`API エラー (${res.status})`);
+    return res.json();
+  }
+
+  async function fetchTodayEvents() {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(start);
+    end.setDate(end.getDate() + 1);
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+    const list = await api(
+      "https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=reader&maxResults=250"
+    );
+    // Google カレンダー上で表示中（チェックが入っている）のカレンダーだけを対象にする
+    const calendars = (list.items || []).filter((c) => c.selected && !c.hidden);
+
+    const results = await Promise.all(
+      calendars.map(async (cal) => {
+        const params = new URLSearchParams({
+          timeMin: start.toISOString(),
+          timeMax: end.toISOString(),
+          singleEvents: "true",
+          orderBy: "startTime",
+          maxResults: "100",
+          timeZone,
+        });
+        try {
+          const data = await api(
+            `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cal.id)}/events?${params}`
+          );
+          return (data.items || []).map((ev) => ({ ev, cal }));
+        } catch (e) {
+          if (e instanceof AuthError) throw e;
+          return []; // 1 つのカレンダーが失敗しても他は表示する
+        }
+      })
+    );
+
+    return results
+      .flat()
+      .filter(({ ev, cal }) => ev.status !== "cancelled" && !declinedByMe(ev, cal))
+      .map(({ ev, cal }) => normalize(ev, cal))
+      .sort((a, b) => (a.allDay !== b.allDay ? (a.allDay ? -1 : 1) : a.start - b.start));
+  }
+
+  function declinedByMe(ev, cal) {
+    const me = (ev.attendees || []).find((a) => a.self);
+    return cal.primary && me && me.responseStatus === "declined";
+  }
+
+  function normalize(ev, cal) {
+    const allDay = !!(ev.start && ev.start.date);
+    const start = allDay ? parseDate(ev.start.date) : new Date(ev.start.dateTime);
+    const end = allDay ? parseDate(ev.end.date) : new Date(ev.end.dateTime);
+    return {
+      title: ev.summary || "(タイトルなし)",
+      location: ev.location || "",
+      calendar: cal.summaryOverride || cal.summary || "",
+      color: cal.backgroundColor || "",
+      link: ev.htmlLink || "",
+      allDay,
+      start,
+      end,
+    };
+  }
+
+  // "YYYY-MM-DD" をローカル時刻の 0:00 として解釈する
+  function parseDate(s) {
+    const [y, m, d] = s.split("-").map(Number);
+    return new Date(y, m - 1, d);
+  }
+
+  // ---------- rendering ----------
+  const timeFmt = new Intl.DateTimeFormat("ja-JP", { hour: "2-digit", minute: "2-digit" });
+
+  function renderDate() {
+    el.date.textContent = new Intl.DateTimeFormat("ja-JP", {
+      month: "long",
+      day: "numeric",
+      weekday: "long",
+    }).format(new Date());
+  }
+
+  function setStatus(text, isError = false) {
+    el.status.textContent = text;
+    el.status.classList.toggle("error", isError);
+    el.status.hidden = !text;
+  }
+
+  function showLogin(message) {
+    el.login.hidden = false;
+    el.actions.hidden = true;
+    el.account.hidden = true;
+    el.events.replaceChildren();
+    setStatus(message || "", !!message);
+    const standalone = navigator.standalone || matchMedia("(display-mode: standalone)").matches;
+    el.installHint.hidden = standalone || !/iPhone|iPad/.test(navigator.userAgent);
+  }
+
+  function renderEvents(events) {
+    el.login.hidden = true;
+    el.actions.hidden = false;
+    setStatus("");
+
+    const email = store.get(KEY_EMAIL);
+    el.account.textContent = email ? `${email} ・ ${events.length} 件` : `${events.length} 件`;
+    el.account.hidden = false;
+
+    if (events.length === 0) {
+      const li = document.createElement("li");
+      li.className = "card empty";
+      li.textContent = "今日の予定はありません 🎉";
+      el.events.replaceChildren(li);
+      return;
+    }
+
+    const now = Date.now();
+    el.events.replaceChildren(
+      ...events.map((e) => {
+        const li = document.createElement("li");
+        const a = document.createElement(e.link ? "a" : "div");
+        a.className = "event";
+        if (e.link) {
+          a.href = e.link;
+          a.target = "_blank";
+          a.rel = "noopener";
+        }
+        if (!e.allDay && e.end <= now) a.classList.add("past");
+        if (!e.allDay && e.start <= now && now < e.end) a.classList.add("now");
+
+        const bar = document.createElement("span");
+        bar.className = "event__bar";
+        if (e.color) bar.style.background = e.color;
+
+        const time = document.createElement("div");
+        time.className = "event__time";
+        if (e.allDay) {
+          time.textContent = "終日";
+        } else {
+          time.textContent = timeFmt.format(e.start);
+          const small = document.createElement("small");
+          small.textContent = timeFmt.format(e.end);
+          time.append(small);
+        }
+
+        const body = document.createElement("div");
+        body.className = "event__body";
+        const title = document.createElement("p");
+        title.className = "event__title";
+        title.textContent = e.title;
+        body.append(title);
+        const meta = [e.location, e.calendar].filter(Boolean).join(" ・ ");
+        if (meta) {
+          const p = document.createElement("p");
+          p.className = "event__meta";
+          p.textContent = meta;
+          body.append(p);
+        }
+
+        a.append(bar, time, body);
+        li.append(a);
+        return li;
+      })
+    );
+  }
+
+  // ---------- main ----------
+  let loading = false;
+
+  async function loadEmail() {
+    if (store.get(KEY_EMAIL)) return;
+    try {
+      const info = await api("https://openidconnect.googleapis.com/v1/userinfo");
+      if (info.email) store.set(KEY_EMAIL, info.email);
+    } catch (e) {
+      if (e instanceof AuthError) throw e;
+    }
+  }
+
+  async function refresh() {
+    if (loading) return;
+    renderDate();
+    if (!validToken()) {
+      if (!trySilentReauth()) showLogin();
+      return;
+    }
+    loading = true;
+    if (!el.events.children.length) setStatus("読み込み中…");
+    try {
+      await loadEmail();
+      renderEvents(await fetchTodayEvents());
+    } catch (e) {
+      if (e instanceof AuthError) {
+        if (!trySilentReauth()) showLogin("ログインの有効期限が切れました。もう一度ログインしてください。");
+      } else {
+        setStatus(navigator.onLine ? e.message : "オフラインです。接続を確認してください。", true);
+      }
+    } finally {
+      loading = false;
+    }
+  }
+
+  function init() {
+    renderDate();
+
+    if (!CLIENT_ID || CLIENT_ID.startsWith("YOUR_")) {
+      showLogin("config.js に Google OAuth クライアント ID を設定してください。");
+      el.loginBtn.disabled = true;
+      return;
+    }
+
+    el.loginBtn.addEventListener("click", () => startAuth());
+    el.refresh.addEventListener("click", refresh);
+    el.logout.addEventListener("click", logout);
+    // ホーム画面アプリに戻ってきたとき（日付が変わった場合も含む）に最新化する
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") refresh();
+    });
+
+    const result = handleRedirect();
+    if ((result === "error" || result === "silent_failed") && !validToken()) {
+      showLogin(result === "error" ? "ログインできませんでした。もう一度お試しください。" : "");
+      return;
+    }
+    refresh();
+  }
+
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  }
+  init();
+})();

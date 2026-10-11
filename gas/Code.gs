@@ -1,8 +1,9 @@
 /**
  * スーパーアプリ「メール」機能のサーバー (Google Apps Script)
  *
- * - 10 分おきに受信トレイの新着を読み、OpenAI で要約・分類して保存しておく
+ * - 1 時間おきに (夜 22 時〜朝 7 時を除く) 受信トレイの新着を読み、OpenAI で要約・分類して保存しておく
  * - アプリ (GitHub Pages) からの依頼に応じて、一覧を返す・ゴミ箱へ移動する・元に戻す
+ * - Notion の「タスク」「買い物リスト」の読み書きを中継する (Notion のキーをアプリに置かないため)
  *
  * Web アプリは「全員 (匿名)」公開にしているが、すべてのリクエストで
  * Google のアクセストークンを検証し、このスクリプトの持ち主本人が
@@ -19,6 +20,7 @@ const INBOX_QUERY = 'in:inbox newer_than:14d';
 const MAX_THREADS = 40;
 const BODY_CHARS = 1200; // AI に渡す本文の長さ (費用を抑えるため冒頭だけ)
 const AI_BATCH = 10; // 1 回の AI 呼び出しでまとめて処理する件数
+const QUIET_HOURS = { from: 22, to: 7 }; // この時間帯は自動チェックをしない (日本時間)
 const CATEGORIES = ['学校・家族', '仕事', '買い物・配送', 'お金・支払い', 'お知らせ', 'SNS', '広告', 'その他'];
 
 function props() {
@@ -31,10 +33,11 @@ function setup() {
   if (!props().getProperty('OPENAI_API_KEY')) {
     throw new Error('先に「プロジェクトの設定 → スクリプト プロパティ」に OPENAI_API_KEY を追加してください。');
   }
+  // 以前の設定 (10 分おき) が残っていれば消してから作り直す
   ScriptApp.getProjectTriggers()
-    .filter((t) => t.getHandlerFunction() === 'processInbox')
+    .filter((t) => ['processInbox', 'scheduledCheck'].indexOf(t.getHandlerFunction()) >= 0)
     .forEach((t) => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('processInbox').timeBased().everyMinutes(10).create();
+  ScriptApp.newTrigger('scheduledCheck').timeBased().everyHours(1).create();
   processInbox();
   Logger.log('準備完了: %s の受信トレイから %s 件を処理しました。', ownerEmail(), loadState().items.length);
 }
@@ -63,6 +66,18 @@ function doPost(e) {
         Gmail.Users.Threads.untrash('me', requireId(req.id));
         Gmail.Users.Threads.modify({ addLabelIds: ['INBOX'] }, 'me', req.id);
         updateOrder((order) => restoreInOrder(order, req.id));
+        return json({ ok: true });
+      case 'notion.list':
+        return json({ items: notionList(req.list) });
+      case 'notion.create':
+        return json({ item: notionCreate(req.list, req.item) });
+      case 'notion.update':
+        return json({ item: notionUpdate(req.list, req.id, req.item) });
+      case 'notion.delete':
+        notionSetTrash(req.list, req.id, true);
+        return json({ ok: true });
+      case 'notion.restore':
+        notionSetTrash(req.list, req.id, false);
         return json({ ok: true });
       default:
         return json({ error: 'unknown_action' });
@@ -116,6 +131,13 @@ function verifyCaller(token) {
 }
 
 // ---------- 受信トレイの処理 ----------
+
+// 1 時間おきの自動チェック。夜間は何もしない (アプリの更新ボタンからは夜間でも確認できる)
+function scheduledCheck() {
+  const hour = Number(Utilities.formatDate(new Date(), 'Asia/Tokyo', 'H'));
+  if (hour >= QUIET_HOURS.from || hour < QUIET_HOURS.to) return;
+  processInbox();
+}
 
 function processInbox() {
   const lock = LockService.getScriptLock();
@@ -445,4 +467,141 @@ function restoreInOrder(order, id) {
   const pos = next.findIndex((x) => date(x) < date(id));
   next.splice(pos < 0 ? next.length : pos, 0, id);
   return next;
+}
+
+// ---------- Notion (タスク・買い物リスト) ----------
+
+const NOTION_VERSION = '2025-09-03';
+
+// アプリで使う項目名と Notion の列の対応。列の名前を変えたらここも合わせる。
+const NOTION_LISTS = {
+  tasks: {
+    dataSourceId: '4d313f92-8ba7-4da6-b23a-9933f6a0b594',
+    fields: {
+      title: { prop: 'タスク', type: 'title' },
+      done: { prop: '完了', type: 'checkbox' },
+      due: { prop: '期限', type: 'date' },
+      priority: { prop: '優先度', type: 'select', options: ['高', '中', '低'] },
+      memo: { prop: 'メモ', type: 'rich_text' },
+    },
+  },
+  shopping: {
+    dataSourceId: '46c37972-31ff-472b-a0d6-b61a72a583c6',
+    fields: {
+      title: { prop: '品名', type: 'title' },
+      done: { prop: '購入済み', type: 'checkbox' },
+      qty: { prop: '数量', type: 'rich_text' },
+      shop: { prop: 'お店', type: 'select', options: ['スーパー', 'ドラッグストア', '100円ショップ', 'ネット', 'その他'] },
+      memo: { prop: 'メモ', type: 'rich_text' },
+    },
+  },
+};
+
+function notionList(list) {
+  const conf = notionConf(list);
+  const items = [];
+  let cursor;
+  for (let i = 0; i < 5; i++) {
+    const body = { page_size: 100 };
+    if (cursor) body.start_cursor = cursor;
+    const res = notionFetch('post', '/data_sources/' + conf.dataSourceId + '/query', body);
+    (res.results || []).forEach((page) => items.push(fromNotionPage(conf, page)));
+    if (!res.has_more) break;
+    cursor = res.next_cursor;
+  }
+  return items;
+}
+
+function notionCreate(list, item) {
+  const conf = notionConf(list);
+  const page = notionFetch('post', '/pages', {
+    parent: { type: 'data_source_id', data_source_id: conf.dataSourceId },
+    properties: toNotionProps(conf, item, true),
+  });
+  return fromNotionPage(conf, page);
+}
+
+function notionUpdate(list, id, item) {
+  const conf = notionConf(list);
+  const page = notionFetch('patch', '/pages/' + requirePageId(id), { properties: toNotionProps(conf, item, false) });
+  return fromNotionPage(conf, page);
+}
+
+// 削除は Notion のゴミ箱へ移すだけにする (元に戻せるように)
+function notionSetTrash(list, id, trash) {
+  notionConf(list);
+  notionFetch('patch', '/pages/' + requirePageId(id), { in_trash: trash });
+}
+
+function notionConf(list) {
+  if (!Object.prototype.hasOwnProperty.call(NOTION_LISTS, list)) throw new Error('unknown list');
+  return NOTION_LISTS[list];
+}
+
+function requirePageId(id) {
+  if (typeof id !== 'string' || !/^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i.test(id)) {
+    throw new Error('invalid id');
+  }
+  return id;
+}
+
+// アプリから届いた項目を Notion の形に変える。届いた項目だけを更新する。
+function toNotionProps(conf, item, creating) {
+  if (!item || typeof item !== 'object') throw new Error('invalid item');
+  const props = {};
+  Object.keys(conf.fields).forEach((key) => {
+    if (!(key in item)) return;
+    const f = conf.fields[key];
+    const v = item[key];
+    const text = (x) => String(x == null ? '' : x).slice(0, 2000);
+    if (f.type === 'title') {
+      if (!text(v).trim()) throw new Error('名前が空です');
+      props[f.prop] = { title: [{ text: { content: text(v).trim() } }] };
+    } else if (f.type === 'rich_text') {
+      props[f.prop] = { rich_text: text(v) ? [{ text: { content: text(v) } }] : [] };
+    } else if (f.type === 'checkbox') {
+      props[f.prop] = { checkbox: !!v };
+    } else if (f.type === 'date') {
+      if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) throw new Error('日付の形式が正しくありません');
+      props[f.prop] = { date: v ? { start: v } : null };
+    } else if (f.type === 'select') {
+      if (v && f.options.indexOf(v) < 0) throw new Error('選択肢にない値です');
+      props[f.prop] = { select: v ? { name: v } : null };
+    }
+  });
+  if (creating && !props[conf.fields.title.prop]) throw new Error('名前が空です');
+  return props;
+}
+
+function fromNotionPage(conf, page) {
+  const item = { id: page.id, url: page.url, created: page.created_time };
+  Object.keys(conf.fields).forEach((key) => {
+    const f = conf.fields[key];
+    const p = (page.properties || {})[f.prop];
+    if (!p) return;
+    if (f.type === 'title') item[key] = (p.title || []).map((t) => t.plain_text).join('');
+    else if (f.type === 'rich_text') item[key] = (p.rich_text || []).map((t) => t.plain_text).join('');
+    else if (f.type === 'checkbox') item[key] = !!p.checkbox;
+    else if (f.type === 'date') item[key] = p.date ? String(p.date.start).slice(0, 10) : '';
+    else if (f.type === 'select') item[key] = p.select ? p.select.name : '';
+  });
+  return item;
+}
+
+function notionFetch(method, path, body) {
+  const token = props().getProperty('NOTION_TOKEN');
+  if (!token) throw new Error('NOTION_TOKEN が未設定です');
+  const res = UrlFetchApp.fetch('https://api.notion.com/v1' + path, {
+    method: method,
+    contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + token, 'Notion-Version': NOTION_VERSION },
+    muteHttpExceptions: true,
+    payload: JSON.stringify(body || {}),
+  });
+  const code = res.getResponseCode();
+  if (code === 404) throw new Error('Notion のページが見つかりません。「スーパーアプリ」ページにインテグレーションを接続してください');
+  if (code < 200 || code >= 300) {
+    throw new Error('Notion API エラー ' + code + ': ' + res.getContentText().slice(0, 300));
+  }
+  return JSON.parse(res.getContentText());
 }

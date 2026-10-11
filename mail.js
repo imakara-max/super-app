@@ -2,9 +2,8 @@
 (() => {
   "use strict";
 
-  const API_URL = (window.APP_CONFIG && window.APP_CONFIG.MAIL_API_URL) || "";
   const KEY_CACHE = "superapp.mailCache";
-  const STALE_MS = 15 * 60 * 1000; // これより古ければ開いたときに新着を確認する
+  const STALE_MS = 60 * 60 * 1000; // これより古ければ開いたときに新着を確認する（夜 22 時〜朝 7 時を除く）
   // 表示順。要返信は分類とは別に先頭へまとめる
   const SECTION_ORDER = ["学校・家族", "仕事", "お金・支払い", "買い物・配送", "お知らせ", "その他", "SNS", "広告"];
   const COLLAPSED = new Set(["SNS", "広告"]);
@@ -21,37 +20,18 @@
     digestLines: $("mail-digest-lines"),
     status: $("mail-status"),
     sections: $("mail-sections"),
-    toast: $("toast"),
-    toastText: $("toast-text"),
-    toastAction: $("toast-action"),
   };
 
   let data = null; // { updatedAt, digest: string[], items: [...] }
   let busy = false;
   const openSections = new Set(); // 折りたたみ表示の開閉状態を再描画後も保つ
 
-  // ---------- サーバーとの通信 ----------
-  class NeedLogin extends Error {}
-
-  async function call(action, extra = {}) {
-    const token = window.SuperApp.getToken();
-    if (!token) throw new NeedLogin("no token");
-    // Content-Type を付けない (text/plain) ことで、Apps Script でも通る単純なリクエストにする
-    const res = await fetch(API_URL, {
-      method: "POST",
-      body: JSON.stringify({ action, accessToken: token, ...extra }),
-    });
-    if (!res.ok) throw new Error(`サーバーエラー (${res.status})`);
-    const body = await res.json();
-    if (body.error === "unauthorized") throw new NeedLogin("unauthorized");
-    if (body.error) throw new Error(body.message || body.error);
-    return body;
-  }
+  const { callServer: call, NeedLogin, showToast } = window.SuperApp;
 
   // ---------- 読み込み ----------
   async function load({ refresh = false } = {}) {
     if (busy) return;
-    if (!API_URL) {
+    if (!window.SuperApp.serverUrl) {
       showMessage("メール機能の準備がまだ終わっていません（README の「メール機能のセットアップ」を参照）。");
       return;
     }
@@ -75,8 +55,10 @@
         writeCache();
         render();
       }
-      const stale = !data.updatedAt || Date.now() - Date.parse(data.updatedAt) > STALE_MS;
-      if (refresh || stale || data.items.some((it) => !it.summary)) {
+      const hour = new Date().getHours();
+      const quiet = hour >= 22 || hour < 7;
+      const stale = !quiet && (!data.updatedAt || Date.now() - Date.parse(data.updatedAt) > STALE_MS);
+      if (refresh || stale || (!quiet && data.items.some((it) => !it.summary))) {
         setStatus("新着を確認して AI が要約しています…");
         data = await call("refresh");
         writeCache();
@@ -268,7 +250,6 @@
   }
 
   async function untrash(item, index) {
-    hideToast();
     data.items.splice(Math.min(index, data.items.length), 0, item);
     render();
     try {
@@ -280,23 +261,6 @@
       render();
       showToast("元に戻せませんでした。Gmail のゴミ箱から戻してください");
     }
-  }
-
-  let toastTimer = 0;
-
-  function showToast(text, undo) {
-    clearTimeout(toastTimer);
-    el.toastText.textContent = text;
-    el.toastAction.hidden = !undo;
-    el.toastAction.onclick = undo || null;
-    el.toast.hidden = false;
-    toastTimer = setTimeout(hideToast, undo ? 6000 : 3000);
-  }
-
-  function hideToast() {
-    clearTimeout(toastTimer);
-    el.toast.hidden = true;
-    el.toastAction.onclick = null;
   }
 
   // ---------- 起動 ----------

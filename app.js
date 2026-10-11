@@ -123,6 +123,7 @@
     store.del(KEY_TOKEN);
     store.del(KEY_EMAIL);
     store.del(KEY_SILENT);
+    store.del("superapp.mailCache"); // メールの要約も端末から消す
     if (token) {
       fetch("https://oauth2.googleapis.com/revoke?token=" + encodeURIComponent(token), {
         method: "POST",
@@ -479,7 +480,7 @@
   }
 
   async function refresh() {
-    if (!el.settings.hidden) return;
+    if (!el.settings.hidden || window.SuperApp.currentView() !== "calendar") return;
     renderHeader();
     if (!validToken()) {
       if (!trySilentReauth()) showLogin();
@@ -533,6 +534,9 @@
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") refresh();
     });
+    document.addEventListener("viewchange", (ev) => {
+      if (ev.detail === "calendar") refresh();
+    });
 
     const result = handleRedirect();
     if ((result === "error" || result === "silent_failed") && !validToken()) {
@@ -541,6 +545,15 @@
     }
     refresh();
   }
+
+  window.SuperApp = Object.assign(window.SuperApp || {}, {
+    getToken: validToken,
+    // トークンが切れていたら自動での取り直しを試み、できなければ false を返す
+    trySilentReauth,
+    signIn: () => startAuth({ reconsent: needsReconsent }),
+    email: () => store.get(KEY_EMAIL),
+    loadEmail: () => loadEmail().catch(() => {}),
+  });
 
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("sw.js").catch(() => {});

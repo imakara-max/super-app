@@ -1,5 +1,5 @@
 // Google Cloud Console で作成した「ウェブ アプリケーション」の OAuth クライアント ID を設定してください。
 // 手順は README.md を参照。
 window.APP_CONFIG = {
-  GOOGLE_CLIENT_ID: "YOUR_CLIENT_ID.apps.googleusercontent.com",
+  GOOGLE_CLIENT_ID: "452575266482-mirnlc3p6m4e0c0ehoritn48jjpk2250.apps.googleusercontent.com",
 };
